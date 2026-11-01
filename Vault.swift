@@ -445,6 +445,123 @@ enum LivePhotoImporter {
     }
 }
 
+// ===== Compat.swift =====
+import SwiftUI
+
+/// iOS 15 兼容的导航容器：内部用 NavigationView，iOS 16+ 表现与 NavigationStack 基本一致
+struct NavStack<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        NavigationView {
+            content
+        }
+        .navigationViewStyle(StackNavigationViewStyle())
+    }
+}
+
+/// iOS 15 兼容的「标题 — 值」行（替代 iOS 16 的 LabeledContent）
+struct InfoRow: View {
+    let title: String
+    let value: String
+
+    init(_ title: String, _ value: String) {
+        self.title = title
+        self.value = value
+    }
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+}
+
+// ===== PhotoPickerSheet.swift =====
+import SwiftUI
+import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
+
+struct PickedPhoto {
+    let data: Data
+    let assetIdentifier: String?
+}
+
+/// PHPicker 包装（iOS 14+ 可用，替代只能在 iOS 16 用的 SwiftUI PhotosPicker）
+struct PhotoPickerSheet: UIViewControllerRepresentable {
+    var selectionLimit: Int = 50
+    var onFinish: ([PickedPhoto]) -> Void
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration(photoLibrary: PHPhotoLibrary.shared())
+        config.filter = .images
+        config.selectionLimit = selectionLimit
+        config.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        private let parent: PhotoPickerSheet
+
+        init(_ parent: PhotoPickerSheet) {
+            self.parent = parent
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+
+            guard !results.isEmpty else {
+                parent.onFinish([])
+                return
+            }
+
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var collected: [PickedPhoto] = []
+
+            for result in results {
+                group.enter()
+                let identifier = result.assetIdentifier
+                let provider = result.itemProvider
+
+                if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                        if let data = data {
+                            lock.lock()
+                            collected.append(PickedPhoto(data: data, assetIdentifier: identifier))
+                            lock.unlock()
+                        }
+                        group.leave()
+                    }
+                } else {
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .main) {
+                self.parent.onFinish(collected)
+            }
+        }
+    }
+}
+
 // ===== Biometrics.swift =====
 import Foundation
 import LocalAuthentication
@@ -665,17 +782,17 @@ struct RootView: View {
     var body: some View {
         ZStack {
             TabView {
-                NavigationStack {
+                NavStack {
                     PhotoGridView()
                 }
                 .tabItem { Label("照片", systemImage: "photo.on.rectangle.angled") }
 
-                NavigationStack {
+                NavStack {
                     AlbumsView()
                 }
                 .tabItem { Label("相簿", systemImage: "rectangle.stack") }
 
-                NavigationStack {
+                NavStack {
                     SettingsView()
                 }
                 .tabItem { Label("设置", systemImage: "gearshape") }
@@ -748,7 +865,6 @@ struct NoticeView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 20)
         }
-        .presentationDetents([.height(370)])
     }
 }
 
@@ -756,13 +872,14 @@ struct NoticeView: View {
 import SwiftUI
 import UIKit
 import PhotosUI
+import UniformTypeIdentifiers
 
 struct PhotoGridView: View {
     let albumFilter: String?
 
     @EnvironmentObject private var library: PhotoLibrary
 
-    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showPicker = false
     @State private var isImporting = false
     @State private var searchText = ""
     @State private var favoritesOnly: Bool
@@ -807,10 +924,9 @@ struct PhotoGridView: View {
         .searchable(text: $searchText, prompt: "搜索备注或相簿")
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                PhotosPicker(selection: $pickerItems,
-                             maxSelectionCount: 50,
-                             matching: .images,
-                             photoLibrary: .shared()) {
+                Button {
+                    showPicker = true
+                } label: {
                     Image(systemName: "plus")
                 }
             }
@@ -820,7 +936,7 @@ struct PhotoGridView: View {
                 } label: {
                     Image(systemName: favoritesOnly ? "heart.fill" : "heart")
                 }
-                .tint(favoritesOnly ? .red : nil)
+                .foregroundColor(favoritesOnly ? .red : nil)
             }
         }
         .overlay {
@@ -833,9 +949,12 @@ struct PhotoGridView: View {
                 importingOverlay
             }
         }
-        .onChange(of: pickerItems) { items in
-            guard !items.isEmpty else { return }
-            Task { await importPicked(items) }
+        .sheet(isPresented: $showPicker) {
+            PhotoPickerSheet(selectionLimit: 50) { picked in
+                showPicker = false
+                guard !picked.isEmpty else { return }
+                Task { await importPicked(picked) }
+            }
         }
         .fullScreenCover(item: $detail) { target in
             PhotoDetailView(photos: photos, index: target.index)
@@ -849,33 +968,25 @@ struct PhotoGridView: View {
 
     // MARK: - 导入
 
-    @MainActor
-    private func importPicked(_ items: [PhotosPickerItem]) async {
+    private func importPicked(_ items: [PickedPhoto]) async {
         isImporting = true
-        var added: [(filename: String, video: String?)] = []
 
         // 实况照片需要读取相册资源，没授权也不影响普通照片导入
         let canReadAssets = await LivePhotoImporter.requestAccess()
+        var added: [(filename: String, video: String?)] = []
 
         for item in items {
-            do {
-                guard let data = try await item.loadTransferable(type: Data.self) else { continue }
-                let filename = try ImageStore.shared.save(data: data)
-
-                var videoName: String?
-                if canReadAssets, let identifier = item.itemIdentifier {
-                    let baseName = (filename as NSString).deletingPathExtension
-                    videoName = await LivePhotoImporter.exportVideo(assetIdentifier: identifier,
-                                                                    baseName: baseName)
-                }
-                added.append((filename: filename, video: videoName))
-            } catch {
-                print("导入失败: \(error)")
+            guard let filename = try? ImageStore.shared.save(data: item.data) else { continue }
+            var videoName: String?
+            if canReadAssets, let identifier = item.assetIdentifier {
+                let baseName = (filename as NSString).deletingPathExtension
+                videoName = await LivePhotoImporter.exportVideo(assetIdentifier: identifier,
+                                                                baseName: baseName)
             }
+            added.append((filename: filename, video: videoName))
         }
 
         library.addPhotos(items: added, albumName: albumFilter)
-        pickerItems = []
         isImporting = false
     }
 
@@ -893,10 +1004,9 @@ struct PhotoGridView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
-            PhotosPicker(selection: $pickerItems,
-                         maxSelectionCount: 50,
-                         matching: .images,
-                         photoLibrary: .shared()) {
+            Button {
+                showPicker = true
+            } label: {
                 Label("导入照片", systemImage: "plus")
                     .font(.subheadline.weight(.semibold))
             }
@@ -1016,7 +1126,7 @@ struct PhotoDetailView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavStack {
             ZStack {
                 Color.black.ignoresSafeArea()
 
@@ -1070,9 +1180,6 @@ struct PhotoDetailView: View {
                     .transition(.opacity)
                 }
             }
-            .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarBackground(.black.opacity(0.7), for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -1118,7 +1225,6 @@ struct PhotoDetailView: View {
             .sheet(isPresented: $showInfo) {
                 if let current {
                     PhotoInfoSheet(photoID: current.id)
-                        .presentationDetents([.medium, .large])
                 }
             }
         }
@@ -1247,23 +1353,22 @@ struct PhotoInfoSheet: View {
     private var photo: Photo? { library.photo(id: photoID) }
 
     var body: some View {
-        NavigationStack {
+        NavStack {
             Form {
                 Section("备注") {
-                    TextField("给这张照片加一句说明", text: $caption, axis: .vertical)
-                        .lineLimit(2...5)
+                    TextEditor(text: $caption)
+                        .frame(minHeight: 76)
                 }
                 Section("归档") {
                     TextField("相簿名称（可留空）", text: $albumName)
                 }
                 if let photo {
                     Section("信息") {
-                        LabeledContent("加入时间",
-                                       value: photo.addedAt.formatted(date: .abbreviated, time: .shortened))
-                        LabeledContent("文件大小",
-                                       value: ImageStore.formatted(bytes: ImageStore.shared.fileSize(for: photo.filename)))
-                        LabeledContent("文件名", value: photo.filename)
-                            .font(.caption)
+                        InfoRow("加入时间",
+                                photo.addedAt.formatted(date: .abbreviated, time: .shortened))
+                        InfoRow("文件大小",
+                                ImageStore.formatted(bytes: ImageStore.shared.fileSize(for: photo.filename)))
+                        InfoRow("文件名", photo.filename)
                     }
                 }
             }
@@ -1396,7 +1501,7 @@ struct AlbumsView: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 30, height: 30)
-                .background(tint.gradient, in: RoundedRectangle(cornerRadius: 7))
+                .background(tint, in: RoundedRectangle(cornerRadius: 7))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -1486,9 +1591,9 @@ struct SettingsView: View {
             }
 
             Section("存储") {
-                LabeledContent("照片数量", value: "\(library.photos.count) 张")
-                LabeledContent("相簿数量", value: "\(library.albums.count) 个")
-                LabeledContent("占用空间", value: ImageStore.formatted(bytes: storageBytes))
+                InfoRow("照片数量", "\(library.photos.count) 张")
+                InfoRow("相簿数量", "\(library.albums.count) 个")
+                InfoRow("占用空间", ImageStore.formatted(bytes: storageBytes))
                 Button {
                     showClearConfirm = true
                 } label: {
@@ -1497,7 +1602,7 @@ struct SettingsView: View {
             }
 
             Section {
-                LabeledContent("作者", value: Brand.authorName)
+                InfoRow("作者", Brand.authorName)
 
                 Button {
                     UIPasteboard.general.string = Brand.contact
@@ -1516,7 +1621,7 @@ struct SettingsView: View {
                     }
                 }
 
-                LabeledContent("版本", value: "1.0")
+                InfoRow("版本", "1.0")
 
                 Text(Brand.notice)
                     .font(.caption)
@@ -1557,7 +1662,7 @@ struct ChangePINView: View {
     @State private var hasPIN = AppLock.hasPIN
 
     var body: some View {
-        NavigationStack {
+        NavStack {
             Form {
                 Section {
                     SecureField("输入 4 位数字密码", text: $first)
