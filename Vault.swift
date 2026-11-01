@@ -11,8 +11,10 @@ struct Photo: Identifiable, Codable, Hashable {
     var isFavorite: Bool
     var caption: String
     var albumName: String?
-    /// 实况照片配对视频的文件名（没有则为 nil）
+    /// 实况照片配对视频 / 视频文件本身的文件名（没有则为 nil）
     var videoFilename: String?
+    /// true 表示这一项是视频（不是实况照片）
+    var isVideo: Bool?
 
     init(id: UUID = UUID(),
          filename: String,
@@ -20,7 +22,8 @@ struct Photo: Identifiable, Codable, Hashable {
          isFavorite: Bool = false,
          caption: String = "",
          albumName: String? = nil,
-         videoFilename: String? = nil) {
+         videoFilename: String? = nil,
+         isVideo: Bool? = nil) {
         self.id = id
         self.filename = filename
         self.addedAt = addedAt
@@ -28,6 +31,7 @@ struct Photo: Identifiable, Codable, Hashable {
         self.caption = caption
         self.albumName = albumName
         self.videoFilename = videoFilename
+        self.isVideo = isVideo
     }
 }
 
@@ -86,9 +90,14 @@ final class PhotoLibrary: ObservableObject {
 
     // MARK: - 照片
 
-    func addPhotos(items: [(filename: String, video: String?)], albumName: String?) {
+    func addPhotos(items: [(filename: String, video: String?)],
+                   albumName: String?,
+                   isVideo: Bool = false) {
         let newItems = items.map {
-            Photo(filename: $0.filename, albumName: albumName, videoFilename: $0.video)
+            Photo(filename: $0.filename,
+                  albumName: albumName,
+                  videoFilename: $0.video,
+                  isVideo: isVideo ? true : nil)
         }
         photos.insert(contentsOf: newItems, at: 0)
         save()
@@ -154,6 +163,7 @@ final class PhotoLibrary: ObservableObject {
 import Foundation
 import UIKit
 import ImageIO
+import AVFoundation
 
 /// 照片文件的落盘与缩略图缓存。全部存在 App 沙盒内，不上传任何服务器。
 final class ImageStore: @unchecked Sendable {
@@ -175,16 +185,50 @@ final class ImageStore: @unchecked Sendable {
         folder.appendingPathComponent(filename)
     }
 
-    /// 存盘（顺带做一次 JPEG 压缩），返回文件名
-    func save(data: Data, quality: CGFloat = 0.9) throws -> String {
-        let name = UUID().uuidString + ".jpg"
+    /// 存盘；gif 原样保留（不能压成 jpg，否则动图就没了）
+    func save(data: Data, fileExtension: String = "jpg", quality: CGFloat = 0.9) throws -> String {
+        let ext = fileExtension.lowercased()
+        let name = UUID().uuidString + "." + ext
         let payload: Data
-        if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: quality) {
+        if ext == "gif" {
+            payload = data
+        } else if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: quality) {
             payload = jpeg
         } else {
             payload = data
         }
         try payload.write(to: url(for: name), options: .atomic)
+        return name
+    }
+
+    /// 把视频文件复制进沙盒
+    func saveVideo(from sourceURL: URL, fileExtension: String) throws -> String {
+        let ext = fileExtension.isEmpty ? "mov" : fileExtension.lowercased()
+        let name = UUID().uuidString + "." + ext
+        let destination = url(for: name)
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.copyItem(at: sourceURL, to: destination)
+        return name
+    }
+
+    func saveVideo(data: Data, fileExtension: String) throws -> String {
+        let ext = fileExtension.isEmpty ? "mov" : fileExtension.lowercased()
+        let name = UUID().uuidString + "." + ext
+        try data.write(to: url(for: name), options: .atomic)
+        return name
+    }
+
+    /// 抽视频首帧当封面
+    func posterImage(forVideo filename: String, maxPixel: CGFloat = 1200) -> String? {
+        let asset = AVURLAsset(url: url(for: filename))
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
+        let time = CMTime(seconds: 0.1, preferredTimescale: 600)
+        guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else { return nil }
+        guard let jpeg = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.85) else { return nil }
+        let name = (filename as NSString).deletingPathExtension + ".jpg"
+        try? jpeg.write(to: url(for: name), options: .atomic)
         return name
     }
 
@@ -492,18 +536,20 @@ import PhotosUI
 import UniformTypeIdentifiers
 
 struct PickedPhoto {
-    let data: Data
-    let assetIdentifier: String?
+    let imageData: Data?
+    let imageExtension: String      // "jpg" / "gif"
+    let videoFilename: String?      // 已落盘的视频文件名（实况配对视频或视频文件）
+    let isVideo: Bool
 }
 
-/// PHPicker 包装（iOS 14+ 可用，替代只能在 iOS 16 用的 SwiftUI PhotosPicker）
+/// PHPicker 包装（iOS 14+）：图片 / GIF / 实况照片 / 视频 全部支持
 struct PhotoPickerSheet: UIViewControllerRepresentable {
     var selectionLimit: Int = 50
     var onFinish: ([PickedPhoto]) -> Void
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration(photoLibrary: PHPhotoLibrary.shared())
-        config.filter = .images
+        config.filter = .any(of: [.images, .videos])
         config.selectionLimit = selectionLimit
         config.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: config)
@@ -538,19 +584,12 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
 
             for result in results {
                 group.enter()
-                let identifier = result.assetIdentifier
-                let provider = result.itemProvider
-
-                if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
-                        if let data = data {
-                            lock.lock()
-                            collected.append(PickedPhoto(data: data, assetIdentifier: identifier))
-                            lock.unlock()
-                        }
-                        group.leave()
+                load(result) { picked in
+                    if let picked = picked {
+                        lock.lock()
+                        collected.append(picked)
+                        lock.unlock()
                     }
-                } else {
                     group.leave()
                 }
             }
@@ -559,6 +598,173 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
                 self.parent.onFinish(collected)
             }
         }
+
+        /// 实况整包 > 视频 > GIF > 普通图片
+        private func load(_ result: PHPickerResult, completion: @escaping (PickedPhoto?) -> Void) {
+            let provider = result.itemProvider
+
+            if provider.hasItemConformingToTypeIdentifier(UTType.livePhoto.identifier) {
+                provider.loadFileRepresentation(forTypeIdentifier: UTType.livePhoto.identifier) { url, _ in
+                    if let url = url, let picked = LivePhotoBundle.read(url) {
+                        completion(picked)
+                    } else {
+                        self.loadStillImage(provider, completion: completion)
+                    }
+                }
+                return
+            }
+
+            if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                self.loadVideo(provider, completion: completion)
+                return
+            }
+
+            loadStillImage(provider, completion: completion)
+        }
+
+        private func loadVideo(_ provider: NSItemProvider,
+                               completion: @escaping (PickedPhoto?) -> Void) {
+            provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                guard let url = url else {
+                    completion(nil)
+                    return
+                }
+                let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension.lowercased()
+                // 这个临时文件在回调结束后会被系统删除，必须立刻复制
+                if let name = try? ImageStore.shared.saveVideo(from: url, fileExtension: ext) {
+                    completion(PickedPhoto(imageData: nil,
+                                           imageExtension: "jpg",
+                                           videoFilename: name,
+                                           isVideo: true))
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+
+        private func loadStillImage(_ provider: NSItemProvider,
+                                    completion: @escaping (PickedPhoto?) -> Void) {
+            let isGIF = provider.hasItemConformingToTypeIdentifier(UTType.gif.identifier)
+            let typeIdentifier = isGIF ? UTType.gif.identifier : UTType.image.identifier
+
+            provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                guard let data = data else {
+                    completion(nil)
+                    return
+                }
+                completion(PickedPhoto(imageData: data,
+                                       imageExtension: isGIF ? "gif" : "jpg",
+                                       videoFilename: nil,
+                                       isVideo: false))
+            }
+        }
+    }
+}
+
+/// 解析 PHPicker 给出的实况照片包（目录里同时有图片和 .mov）
+enum LivePhotoBundle {
+    private static let videoExtensions = ["mov", "mp4", "m4v"]
+    private static let imageExtensions = ["jpg", "jpeg", "heic", "png"]
+
+    static func read(_ url: URL) -> PickedPhoto? {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return nil }
+
+        if !isDirectory.boolValue {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            let ext = url.pathExtension.lowercased() == "gif" ? "gif" : "jpg"
+            return PickedPhoto(imageData: data, imageExtension: ext,
+                               videoFilename: nil, isVideo: false)
+        }
+
+        let contents = (try? fileManager.contentsOfDirectory(at: url,
+                                                             includingPropertiesForKeys: nil)) ?? []
+        guard let imageURL = contents.first(where: {
+            imageExtensions.contains($0.pathExtension.lowercased())
+        }), let imageData = try? Data(contentsOf: imageURL) else { return nil }
+
+        var videoName: String?
+        if let videoURL = contents.first(where: {
+            videoExtensions.contains($0.pathExtension.lowercased())
+        }) {
+            let ext = videoURL.pathExtension.lowercased()
+            if let data = try? Data(contentsOf: videoURL) {
+                videoName = try? ImageStore.shared.saveVideo(data: data, fileExtension: ext)
+            }
+        }
+
+        return PickedPhoto(imageData: imageData, imageExtension: "jpg",
+                           videoFilename: videoName, isVideo: false)
+    }
+}
+
+// ===== AnimatedImage.swift =====
+import SwiftUI
+import UIKit
+import ImageIO
+
+/// 把 GIF / 动态图解码成 UIImage 的动画序列
+enum AnimatedImageLoader {
+    static func image(at url: URL) -> UIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let count = CGImageSourceGetCount(source)
+        if count <= 1 {
+            return UIImage(contentsOfFile: url.path)
+        }
+
+        var frames: [UIImage] = []
+        var totalDuration: Double = 0
+        for index in 0..<count {
+            guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
+            frames.append(UIImage(cgImage: cgImage))
+            totalDuration += frameDuration(source, index: index)
+        }
+        guard !frames.isEmpty else { return nil }
+        return UIImage.animatedImage(with: frames, duration: max(totalDuration, 0.1))
+    }
+
+    private static func frameDuration(_ source: CGImageSource, index: Int) -> Double {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+              let gif = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+            return 0.1
+        }
+        if let delay = gif[kCGImagePropertyGIFUnclampedDelayTime] as? Double, delay > 0.011 {
+            return delay
+        }
+        if let delay = gif[kCGImagePropertyGIFDelayTime] as? Double, delay > 0.011 {
+            return delay
+        }
+        return 0.1
+    }
+}
+
+/// 能播放动图的 UIImageView 包装（SwiftUI 的 Image 不会播放 GIF）
+struct AnimatedImageView: UIViewRepresentable {
+    let url: URL
+    var contentMode: ContentMode = .fit
+
+    func makeUIView(context: Context) -> UIImageView {
+        let view = UIImageView()
+        view.clipsToBounds = true
+        view.contentMode = contentMode == .fit ? .scaleAspectFit : .scaleAspectFill
+        view.backgroundColor = .clear
+        view.image = AnimatedImageLoader.image(at: url)
+        view.startAnimating()
+        return view
+    }
+
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        if uiView.image == nil {
+            uiView.image = AnimatedImageLoader.image(at: url)
+            uiView.startAnimating()
+        }
+    }
+}
+
+extension Photo {
+    var isAnimatedGIF: Bool {
+        filename.lowercased().hasSuffix(".gif")
     }
 }
 
@@ -971,22 +1177,25 @@ struct PhotoGridView: View {
     private func importPicked(_ items: [PickedPhoto]) async {
         isImporting = true
 
-        // 实况照片需要读取相册资源，没授权也不影响普通照片导入
-        let canReadAssets = await LivePhotoImporter.requestAccess()
-        var added: [(filename: String, video: String?)] = []
-
         for item in items {
-            guard let filename = try? ImageStore.shared.save(data: item.data) else { continue }
-            var videoName: String?
-            if canReadAssets, let identifier = item.assetIdentifier {
-                let baseName = (filename as NSString).deletingPathExtension
-                videoName = await LivePhotoImporter.exportVideo(assetIdentifier: identifier,
-                                                                baseName: baseName)
+            // 视频：抽首帧当封面，视频本身留在沙盒
+            if item.isVideo, let video = item.videoFilename {
+                let poster = ImageStore.shared.posterImage(forVideo: video) ?? video
+                library.addPhotos(items: [(filename: poster, video: video)],
+                                  albumName: albumFilter,
+                                  isVideo: true)
+                continue
             }
-            added.append((filename: filename, video: videoName))
+
+            guard let data = item.imageData,
+                  let imageName = try? ImageStore.shared.save(data: data,
+                                                              fileExtension: item.imageExtension)
+            else { continue }
+
+            library.addPhotos(items: [(filename: imageName, video: item.videoFilename)],
+                              albumName: albumFilter)
         }
 
-        library.addPhotos(items: added, albumName: albumFilter)
         isImporting = false
     }
 
@@ -1063,7 +1272,14 @@ struct PhotoThumb: View {
                 }
             }
             .overlay(alignment: .topLeading) {
-                if photo.videoFilename != nil {
+                if photo.isVideo == true {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(4)
+                        .background(Color.black.opacity(0.45), in: Circle())
+                        .padding(4)
+                } else if photo.videoFilename != nil {
                     Text("LIVE")
                         .font(.system(size: 8, weight: .heavy))
                         .foregroundStyle(.white)
@@ -1113,7 +1329,8 @@ struct PhotoDetailView: View {
 
     /// 实况视频地址（文件不存在就当作没有）
     private var currentVideoURL: URL? {
-        guard let current, let fresh = library.photo(id: current.id),
+        guard let current, current.isVideo != true,
+              let fresh = library.photo(id: current.id),
               let video = fresh.videoFilename else { return nil }
         let url = ImageStore.shared.url(for: video)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
@@ -1132,8 +1349,15 @@ struct PhotoDetailView: View {
 
                 TabView(selection: $index) {
                     ForEach(photos.indices, id: \.self) { i in
-                        ZoomablePhoto(photo: photos[i])
-                            .tag(i)
+                        Group {
+                            if photos[i].isVideo == true,
+                               let video = photos[i].videoFilename {
+                                VideoPage(url: ImageStore.shared.url(for: video))
+                            } else {
+                                ZoomablePhoto(photo: photos[i])
+                            }
+                        }
+                        .tag(i)
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
@@ -1275,7 +1499,15 @@ struct ZoomablePhoto: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                if let image {
+                if photo.isAnimatedGIF {
+                    AnimatedImageView(url: ImageStore.shared.url(for: photo.filename))
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .scaleEffect(scale)
+                        .offset(offset)
+                        .gesture(magnification)
+                        .gesture(drag, including: scale > 1 ? .all : .subviews)
+                        .onTapGesture(count: 2) { toggleZoom() }
+                } else if let image {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFit()
@@ -1284,16 +1516,7 @@ struct ZoomablePhoto: View {
                         .offset(offset)
                         .gesture(magnification)
                         .gesture(drag, including: scale > 1 ? .all : .subviews)
-                        .onTapGesture(count: 2) {
-                            withAnimation(.spring(response: 0.3)) {
-                                if scale > 1 {
-                                    resetZoom()
-                                } else {
-                                    scale = 2.5
-                                    baseScale = 2.5
-                                }
-                            }
-                        }
+                        .onTapGesture(count: 2) { toggleZoom() }
                 } else {
                     ProgressView().tint(.white)
                 }
@@ -1301,11 +1524,23 @@ struct ZoomablePhoto: View {
             .frame(width: geo.size.width, height: geo.size.height)
         }
         .task(id: photo.filename) {
+            guard !photo.isAnimatedGIF else { return }
             let name = photo.filename
             let loaded = await Task.detached(priority: .userInitiated) {
                 ImageStore.shared.image(for: name)
             }.value
             image = loaded
+        }
+    }
+
+    private func toggleZoom() {
+        withAnimation(.spring(response: 0.3)) {
+            if scale > 1 {
+                resetZoom()
+            } else {
+                scale = 2.5
+                baseScale = 2.5
+            }
         }
     }
 
@@ -1422,6 +1657,34 @@ struct LivePlayerView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+
+// MARK: - 视频播放页
+
+struct VideoPage: View {
+    let url: URL
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let player = player {
+                VideoPlayer(player: player)
+                    .ignoresSafeArea()
+            } else {
+                ProgressView().tint(.white)
+            }
+        }
+        .onAppear {
+            if player == nil {
+                player = AVPlayer(url: url)
+            }
+        }
+        .onDisappear {
+            player?.pause()
+        }
     }
 }
 
