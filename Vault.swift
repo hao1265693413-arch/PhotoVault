@@ -78,6 +78,22 @@ final class PhotoLibrary: ObservableObject {
         guard let archive = try? decoder.decode(Archive.self, from: data) else { return }
         photos = archive.photos
         albums = archive.albums
+        migrateLegacyVideos()
+    }
+
+    /// 旧版本把视频文件名当封面存了，这里补上 isVideo 并重新抽封面
+    private func migrateLegacyVideos() {
+        var changed = false
+        for index in photos.indices where photos[index].isVideo == nil {
+            let ext = (photos[index].filename as NSString).pathExtension.lowercased()
+            guard ["mov", "mp4", "m4v"].contains(ext) else { continue }
+            let video = photos[index].filename
+            photos[index].isVideo = true
+            photos[index].videoFilename = video
+            photos[index].filename = ImageStore.shared.posterImage(forVideo: video) ?? ""
+            changed = true
+        }
+        if changed { save() }
     }
 
     private func save() {
@@ -721,7 +737,7 @@ enum AnimatedImageLoader {
             totalDuration += frameDuration(source, index: index)
         }
         guard !frames.isEmpty else { return nil }
-        return UIImage.animatedImage(with: frames, duration: max(totalDuration, 0.1))
+        return UIImage.animatedImage(with: frames, duration: max(totalDuration, 0.1)) ?? frames.first
     }
 
     private static func frameDuration(_ source: CGImageSource, index: Int) -> Double {
@@ -765,6 +781,140 @@ struct AnimatedImageView: UIViewRepresentable {
 extension Photo {
     var isAnimatedGIF: Bool {
         filename.lowercased().hasSuffix(".gif")
+    }
+}
+
+// ===== Diagnostics.swift =====
+import SwiftUI
+import UIKit
+
+/// 把导入过程写成日志，出问题时可以直接复制出来看
+enum ImportLog {
+    static var fileURL: URL {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("import.log")
+    }
+
+    static func write(_ line: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let text = "[\(formatter.string(from: Date()))] \(line)\n"
+
+        guard let data = text.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    static func read() -> String {
+        (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "（还没有导入记录）"
+    }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: fileURL)
+    }
+}
+
+struct DiagnosticsView: View {
+    @EnvironmentObject private var library: PhotoLibrary
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var log: String = ""
+    @State private var copied = false
+
+    private var counts: String {
+        let videos = library.photos.filter { $0.isVideo == true }.count
+        let lives = library.photos.filter { $0.isVideo != true && $0.videoFilename != nil }.count
+        let gifs = library.photos.filter { $0.isAnimatedGIF }.count
+        return "共 \(library.photos.count) 项 · 视频 \(videos) · 实况 \(lives) · 动图 \(gifs)"
+    }
+
+    var body: some View {
+        Form {
+            Section("统计") {
+                Text(counts)
+                    .font(.footnote)
+            }
+
+            Section {
+                if library.photos.isEmpty {
+                    Text("还没有导入任何文件")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(library.photos.prefix(12)) { photo in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(photo.isVideo == true
+                             ? "视频 · \(photo.videoFilename ?? "-")"
+                             : (photo.videoFilename != nil ? "实况 · \(photo.filename)" : "图片 · \(photo.filename)"))
+                            .font(.caption)
+                            .lineLimit(1)
+                        Text(detailLine(photo))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("最近导入")
+            }
+
+            Section {
+                ScrollView {
+                    Text(log.isEmpty ? ImportLog.read() : log)
+                        .font(.system(size: 10, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minHeight: 160, maxHeight: 260)
+
+                Button {
+                    UIPasteboard.general.string = "【环境】\(UIDevice.current.systemName) \(UIDevice.current.systemVersion) \(UIDevice.current.model)\n【统计】\(counts)\n【日志】\n" + ImportLog.read()
+                    withAnimation { copied = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation { copied = false }
+                    }
+                } label: {
+                    Label(copied ? "已复制到剪贴板" : "复制全部诊断信息",
+                          systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                }
+
+                Button(role: .destructive) {
+                    ImportLog.clear()
+                    log = ImportLog.read()
+                } label: {
+                    Label("清空日志", systemImage: "trash")
+                }
+            } header: {
+                Text("导入日志")
+            } footer: {
+                Text("把「复制全部诊断信息」的内容发给我，就能定位到底哪一步失败。")
+            }
+        }
+        .navigationTitle("诊断")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { log = ImportLog.read() }
+    }
+
+    private func detailLine(_ photo: Photo) -> String {
+        var parts: [String] = []
+        if !photo.filename.isEmpty {
+            parts.append("封面 \(byteText(photo.filename))")
+        } else {
+            parts.append("无封面")
+        }
+        if let video = photo.videoFilename {
+            parts.append("视频 \(byteText(video))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func byteText(_ filename: String) -> String {
+        let size = ImageStore.shared.fileSize(for: filename)
+        if size == 0 { return "缺失!" }
+        return ImageStore.formatted(bytes: size)
     }
 }
 
@@ -1090,6 +1240,8 @@ struct PhotoGridView: View {
     @State private var searchText = ""
     @State private var favoritesOnly: Bool
     @State private var detail: DetailTarget?
+    @State private var importSummary = ""
+    @State private var showSummary = false
 
     init(albumFilter: String? = nil, onlyFavorites: Bool = false) {
         self.albumFilter = albumFilter
@@ -1162,6 +1314,9 @@ struct PhotoGridView: View {
                 Task { await importPicked(picked) }
             }
         }
+        .alert(importSummary, isPresented: $showSummary) {
+            Button("好", role: .cancel) { }
+        }
         .fullScreenCover(item: $detail) { target in
             PhotoDetailView(photos: photos, index: target.index)
         }
@@ -1176,27 +1331,51 @@ struct PhotoGridView: View {
 
     private func importPicked(_ items: [PickedPhoto]) async {
         isImporting = true
+        ImportLog.write("==== 开始导入 \(items.count) 项 ====")
+
+        var ok = 0, videoCount = 0, liveCount = 0, gifCount = 0, failed = 0
 
         for item in items {
-            // 视频：抽首帧当封面，视频本身留在沙盒
+            // 视频：视频留在沙盒，封面尽力而为（失败就留空，不再拿 .mov 冒充图片）
             if item.isVideo, let video = item.videoFilename {
-                let poster = ImageStore.shared.posterImage(forVideo: video) ?? video
-                library.addPhotos(items: [(filename: poster, video: video)],
+                let poster = ImageStore.shared.posterImage(forVideo: video)
+                ImportLog.write("视频 \(video) 字节=\(ImageStore.shared.fileSize(for: video)) 封面=\(poster ?? "抽取失败")")
+                library.addPhotos(items: [(filename: poster ?? "", video: video)],
                                   albumName: albumFilter,
                                   isVideo: true)
+                videoCount += 1
+                ok += 1
                 continue
             }
 
             guard let data = item.imageData,
                   let imageName = try? ImageStore.shared.save(data: data,
                                                               fileExtension: item.imageExtension)
-            else { continue }
+            else {
+                failed += 1
+                ImportLog.write("失败：没有图片数据")
+                continue
+            }
+
+            ImportLog.write("图片 \(imageName) 类型=\(item.imageExtension) 字节=\(data.count) 实况视频=\(item.videoFilename ?? "无")")
+            if item.imageExtension == "gif" { gifCount += 1 }
+            if item.videoFilename != nil { liveCount += 1 }
 
             library.addPhotos(items: [(filename: imageName, video: item.videoFilename)],
                               albumName: albumFilter)
+            ok += 1
         }
 
         isImporting = false
+        ImportLog.write("==== 完成：成功 \(ok) 视频 \(videoCount) 实况 \(liveCount) 动图 \(gifCount) 失败 \(failed) ====")
+
+        var summary = "成功导入 \(ok) 项"
+        if videoCount > 0 { summary += "，视频 \(videoCount)" }
+        if liveCount > 0 { summary += "，实况 \(liveCount)" }
+        if gifCount > 0 { summary += "，动图 \(gifCount)" }
+        if failed > 0 { summary += "，失败 \(failed)" }
+        importSummary = summary
+        showSummary = true
     }
 
     // MARK: - 空状态 / 进度
@@ -1258,6 +1437,13 @@ struct PhotoThumb: View {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
+                } else if photo.filename.isEmpty {
+                    ZStack {
+                        Color.black.opacity(0.85)
+                        Image(systemName: "play.circle.fill")
+                            .font(.system(size: 26))
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
                 } else {
                     ProgressView().scaleEffect(0.7)
                 }
@@ -1292,6 +1478,7 @@ struct PhotoThumb: View {
             .contentShape(Rectangle())
             .clipped()
             .task(id: photo.filename) {
+                guard !photo.filename.isEmpty else { return }
                 let name = photo.filename
                 let loaded = await Task.detached(priority: .userInitiated) {
                     ImageStore.shared.thumbnail(for: name, maxPixel: 340)
@@ -1862,6 +2049,16 @@ struct SettingsView: View {
                 } label: {
                     Label("清理缩略图缓存", systemImage: "arrow.clockwise")
                 }
+            }
+
+            Section {
+                NavigationLink(destination: DiagnosticsView()) {
+                    Label("诊断与日志", systemImage: "stethoscope")
+                }
+            } header: {
+                Text("排错")
+            } footer: {
+                Text("导入失败、视频或动图看不了时，进这里复制诊断信息发给我。")
             }
 
             Section {
