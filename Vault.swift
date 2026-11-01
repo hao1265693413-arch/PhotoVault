@@ -1693,7 +1693,7 @@ struct ChangePINView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("保存") { save() }
-                        .fontWeight(.semibold)
+                        .font(.body.weight(.semibold))
                 }
             }
         }
