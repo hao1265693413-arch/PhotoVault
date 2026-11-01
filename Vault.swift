@@ -1,5 +1,5 @@
 // PhotoVault - single-file build for GitHub Actions (iOS 16+)
-// 合并自 PhotoVault/Vault/*.swift，不要直接改这个文件，改原工程后重新合并。
+// 由 merge.py 自动合并，请勿直接改这个文件。
 
 // ===== Models.swift =====
 import Foundation
@@ -960,6 +960,7 @@ struct AlbumsView: View {
 
 // ===== SettingsView.swift =====
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var library: PhotoLibrary
@@ -967,6 +968,7 @@ struct SettingsView: View {
     @AppStorage("lockEnabled") private var lockEnabled = false
     @State private var storageBytes: Int64 = 0
     @State private var showClearConfirm = false
+    @State private var copied = false
 
     private var biometricName: String {
         Biometrics.isAvailable ? "面容 / 指纹" : "设备密码"
@@ -996,12 +998,31 @@ struct SettingsView: View {
                 }
             }
 
-            Section("关于") {
-                LabeledContent("照片存放位置", value: "App 沙盒内")
-                Text("所有照片都只保存在这台设备上，不上传服务器。卸载 App 会一起删除，建议定期用「存回系统相册」备份重要的照片。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Section {
+                LabeledContent("作者", value: "豪 hao")
+
+                Button {
+                    UIPasteboard.general.string = "hao1265693413"
+                    withAnimation { copied = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation { copied = false }
+                    }
+                } label: {
+                    HStack {
+                        Text("联系方式").foregroundStyle(.primary)
+                        Spacer()
+                        Text("hao1265693413")
+                            .foregroundStyle(.secondary)
+                        Image(systemName: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                            .foregroundStyle(copied ? .green : .accentColor)
+                    }
+                }
+
                 LabeledContent("版本", value: "1.0")
+            } header: {
+                Text("关于")
+            } footer: {
+                Text("照片保险箱 · 由 豪 hao 制作。\n所有照片只保存在这台设备上，不上传服务器。卸载 App 会一起删除，建议定期用「存回系统相册」备份重要的照片。")
             }
         }
         .navigationTitle("设置")
